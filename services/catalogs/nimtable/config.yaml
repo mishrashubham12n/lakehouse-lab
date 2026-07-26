@@ -1,0 +1,38 @@
+# =============================================================================
+# Nimtable configuration — mounted at /nimtable/config.yaml (Nimtable's cwd)
+# =============================================================================
+# Discovered schema keys: server, database, catalogs, compactor.
+# Nimtable's Java Config beans reject unknown fields (Jackson strict mode).
+# =============================================================================
+
+server:
+  # Nimtable backend REST API — the nimtable-web (Next.js) container reaches this
+  # via container DNS (JAVA_API_URL=http://nimtable:8182). The nimtable-web
+  # container is what students open at http://localhost:${NIMTABLE_PORT:-8090}.
+  port: 8182
+  host: 0.0.0.0
+
+# Nimtable's own persistence — shares polaris-postgres via a separate DB.
+database:
+  url: "jdbc:postgresql://polaris-postgres:5432/nimtable"
+  username: polaris
+  password: polaris
+
+catalogs:
+  # Nessie hosts a full Iceberg REST catalog at /iceberg/. `warehouse` is the
+  # LOGICAL name Nessie has registered via NESSIE_CATALOG_DEFAULT_WAREHOUSE,
+  # NOT the s3a location — Nessie resolves the physical location internally.
+  - name: nessie
+    type: rest
+    uri: http://nessie:19120/iceberg/
+    warehouse: warehouse
+
+  # Polaris — Iceberg REST + RBAC. Nimtable's Iceberg REST client fetches an
+  # OAuth2 token via client_credentials against Polaris. The Polaris-Realm
+  # header is derived server-side from the token, so we don't need to send it.
+  - name: polaris
+    type: rest
+    uri: http://polaris:8181/api/catalog
+    warehouse: lab
+    credential: "root:secret"
+    scope: "PRINCIPAL_ROLE:ALL"

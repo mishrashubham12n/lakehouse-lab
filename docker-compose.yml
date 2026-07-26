@@ -1,0 +1,43 @@
+# =============================================================================
+# lakehouse-lab — thin orchestrator that includes per-service compose files
+# =============================================================================
+# Each subsystem lives in services/<name>/compose.yml with its own README.
+# Add a new subsystem: drop a services/<name>/compose.yml, add an entry here,
+# add a make/<name>.mk if it needs bespoke targets. No cross-file surgery.
+#
+# `project_directory: .` makes relative paths in each included file (bind
+# mounts to ./.tmp/, config mounts to ./conf/) resolve from the repo root,
+# not the included file's directory. Requires Docker Compose v2.20+ (Aug 2023).
+#
+# Profiles:
+#   (default)   spark + ministack + kafka         → `make up`
+#   cdc         + postgres + kafka-connect        → `make cdc-up`
+#   monitoring  + prometheus + grafana + exps     → `make monitoring-up`
+#   catalogs    + nessie + polaris + nimtable     → `make catalogs-up`
+#   explorer    + stackport + superset            → `make stackport-up` / `make superset-up`
+# =============================================================================
+
+include:
+  - path: services/spark/compose.yml
+    project_directory: .
+  - path: services/ministack/compose.yml
+    project_directory: .
+  - path: services/kafka/compose.yml
+    project_directory: .
+  - path: services/cdc/compose.yml
+    project_directory: .
+  - path: services/monitoring/compose.yml
+    project_directory: .
+  - path: services/catalogs/compose.yml
+    project_directory: .
+  - path: services/stackport/compose.yml
+    project_directory: .
+  - path: services/explorer/compose.yml
+    project_directory: .
+
+# Top-level named volumes (referenced by service compose files).
+volumes:
+  ivy-cache:
+    name: lakehouse-lab-ivy-cache
+  grafana-data:
+    name: lakehouse-lab-grafana-data

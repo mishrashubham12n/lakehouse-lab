@@ -1,0 +1,103 @@
+# =============================================================================
+# services/explorer — universal cross-catalog / cross-format explorer
+# -----------------------------------------------------------------------------
+# WS9 outcome: keep Nimtable for Iceberg depth AND add Apache Superset over
+# the Spark Thrift Server (already running on :10000) as a universal explorer.
+# Since spark-connect owns every registered catalog (Delta / Iceberg / Nessie /
+# Polaris / Glue), Superset -> Thrift -> Spark gives us one UI that browses
+# all three formats without a second engine.
+#
+# Opt-in via profile: explorer. Started by `make superset-up`.
+# =============================================================================
+
+services:
+
+  # ── Postgres metadata store for Superset ─────────────────────────────────
+  # Own postgres — NOT polaris-postgres (that one is owned by services/catalogs).
+  # Not published to host: internal-only on the lab network.
+  superset-postgres:
+    image: postgres:16
+    container_name: superset-postgres
+    profiles: ["explorer"]
+    mem_limit: ${SUPERSET_POSTGRES_MEM_LIMIT:-256m}
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=superset
+      - POSTGRES_PASSWORD=superset
+      - POSTGRES_DB=superset
+    volumes:
+      - ./.tmp/superset-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset -d superset"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Superset — universal explorer over Spark Thrift ──────────────────────
+  # First start pip-installs pyhive + thrift on top of the base image so we
+  # don't own a Dockerfile just to add two libs. Adds ~30s to the first boot;
+  # negligible on restarts because we bake the pip cache into the volume via
+  # /root (root user override). Trade-off documented in the README.
+  superset:
+    image: apache/superset:latest
+    container_name: superset
+    profiles: ["explorer"]
+    mem_limit: ${SUPERSET_MEM_LIMIT:-2g}
+    user: "root"
+    ports:
+      - "${SUPERSET_PORT:-8088}:8088"
+    environment:
+      - SUPERSET_SECRET_KEY=dev-only-not-secret
+      - SUPERSET_LOAD_EXAMPLES=no
+      - PYTHONPATH=/app/pythonpath
+    volumes:
+      - ./services/explorer/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    extra_hosts:
+      # Linux-parity: on Mac this resolves for free; on Linux students may want
+      # host.docker.internal to reach services running on the laptop directly.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      superset-postgres:
+        condition: service_healthy
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        echo "[explorer] uv pip: psycopg2 + pyhive + thrift + pure-sasl ..."
+        # apache/superset:latest ships uv as its installer targeting /app/.venv.
+        # `uv pip install` (no --python) installs into the active venv.
+        # - psycopg2-binary: Postgres driver for Superset's metadata DB.
+        # - pyhive WITHOUT `[hive]` extra: that extra pulls the C-ext `sasl`
+        #   which would need g++ at build time.
+        # - pure-sasl is pure Python; thrift_sasl uses it transparently.
+        uv pip install --python /app/.venv/bin/python --no-cache-dir \
+          psycopg2-binary pyhive thrift thrift_sasl pure-sasl
+        echo "[explorer] superset db upgrade ..."
+        superset db upgrade
+        echo "[explorer] ensuring admin user (idempotent) ..."
+        superset fab create-admin \
+          --username admin --firstname Admin --lastname User \
+          --email admin@localhost --password admin \
+          || echo "[explorer] admin already exists"
+        echo "[explorer] superset init ..."
+        superset init
+        echo "[explorer] launching gunicorn on :8088 ..."
+        exec gunicorn \
+          --bind 0.0.0.0:8088 \
+          --workers 2 \
+          --timeout 120 \
+          --limit-request-line 0 \
+          --limit-request-field_size 0 \
+          --access-logfile - \
+          "superset.app:create_app()"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8088/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    restart: unless-stopped

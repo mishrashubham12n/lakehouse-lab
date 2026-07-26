@@ -1,0 +1,236 @@
+# =============================================================================
+# services/catalogs — Nessie + Polaris + Polaris-Postgres + Nimtable
+# =============================================================================
+# Opt-in via profile: catalogs. Started by `make catalogs-up`.
+#
+# Nessie          — Iceberg REST + Git-like branching (RocksDB embedded)
+# Polaris         — Iceberg REST + RBAC (Postgres-backed — H2 driver not
+#                   shipped in the apache/polaris:1.6.0 image)
+# polaris-postgres — dedicated backing DB for Polaris (bind: ./.tmp/polaris/)
+# Nimtable         — Web UI for browsing Iceberg tables in both catalogs
+# =============================================================================
+
+services:
+
+  # ── Nessie — Iceberg REST catalog with Git-like branching ─────────────────
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.108.0
+    container_name: nessie
+    profiles: ["catalogs"]
+    mem_limit: ${NESSIE_MEM_LIMIT:-512m}
+    ports:
+      - "${NESSIE_PORT:-19120}:19120"
+    environment:
+      - NESSIE_VERSION_STORE_TYPE=ROCKSDB
+      - NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH=/nessie/data
+      # Iceberg REST catalog warehouse config — Nessie 0.100+ hosts the REST
+      # catalog at /iceberg/, but requires warehouses to be pre-declared.
+      - NESSIE_CATALOG_DEFAULT_WAREHOUSE=warehouse
+      - NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION=s3://warehouse/nessie/
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT=http://ministack:4566
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS=true
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION=us-east-1
+      # Nessie 0.108 requires S3 credentials via the Quarkus URN-secret pattern:
+      # `access-key` (NOT `access-key-id`) points to a Quarkus config prefix
+      # whose `.name` / `.secret` sub-keys carry the actual access key + secret.
+      # See https://projectnessie.org/guides/iceberg-rest/ (§ warehouse config).
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY=urn:nessie-secret:quarkus:s3creds
+      - S3CREDS_NAME=test
+      - S3CREDS_SECRET=test
+    volumes:
+      - ./.tmp/nessie:/nessie/data
+    # Nessie 0.108 has no /q/health — use the auth-free config endpoint instead.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:19120/api/v2/config > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Polaris backing store — small Postgres, dedicated to Polaris ──────────
+  # Not the CDC-track Postgres — that one is for a totally different lesson.
+  # Kept in the same profile so the whole catalog stack lives/dies together.
+  polaris-postgres:
+    image: postgres:16
+    container_name: polaris-postgres
+    profiles: ["catalogs"]
+    mem_limit: ${POLARIS_POSTGRES_MEM_LIMIT:-256m}
+    # NOT published to host — internal only (avoid clash with CDC postgres:5432).
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=polaris
+      - POSTGRES_PASSWORD=polaris
+      - POSTGRES_DB=polaris
+      # Postgres init script creates a second DB for Nimtable — one Postgres,
+      # two logical DBs (polaris_schema.* for Polaris, public.* for Nimtable).
+      - NIMTABLE_DB=nimtable
+    volumes:
+      - ./.tmp/polaris:/var/lib/postgresql/data
+      - ./services/catalogs/scripts/init-nimtable-db.sh:/docker-entrypoint-initdb.d/init-nimtable-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polaris -d polaris"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Polaris bootstrap — one-shot, initializes schema + root principal ─────
+  # apache/polaris-admin-tool `bootstrap -r default -c default,root,secret`
+  # creates polaris_schema.* + the root principal. Idempotent wrapper: if the
+  # bootstrap command exits non-zero (usual case: "already bootstrapped"), we
+  # still exit 0 so compose's `service_completed_successfully` gate passes on
+  # every restart.
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:1.6.0
+    container_name: polaris-bootstrap
+    profiles: ["catalogs"]
+    environment:
+      - QUARKUS_DATASOURCE_DB_KIND=postgresql
+      - QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://polaris-postgres:5432/polaris
+      - QUARKUS_DATASOURCE_USERNAME=polaris
+      - QUARKUS_DATASOURCE_PASSWORD=polaris
+      - POLARIS_PERSISTENCE_TYPE=relational-jdbc
+    entrypoint:
+      - sh
+      - -c
+      - |
+        java -jar /deployments/polaris-admin-tool.jar bootstrap -r default -c default,root,secret
+        rc=$$?
+        if [ $$rc -eq 0 ]; then
+          echo "polaris-bootstrap: initialized"
+        else
+          echo "polaris-bootstrap: already initialized (exit $$rc treated as success)"
+        fi
+        exit 0
+    depends_on:
+      polaris-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Polaris — Iceberg REST catalog with RBAC (Postgres-backed) ────────────
+  # Config mirrors the official plugins/spark/v4.0/getting-started/docker-compose.yml
+  # from the apache/polaris repo — realm-context.realms is what makes 8181 stop
+  # returning "Realm is not bootstrapped".
+  polaris:
+    image: apache/polaris:1.6.0
+    container_name: polaris
+    profiles: ["catalogs"]
+    mem_limit: ${POLARIS_MEM_LIMIT:-768m}
+    ports:
+      - "${POLARIS_PORT:-8181}:8181"
+      - "${POLARIS_MGMT_PORT:-8182}:8182"   # management port (healthcheck)
+    environment:
+      # Persistence
+      - POLARIS_PERSISTENCE_TYPE=relational-jdbc
+      - QUARKUS_DATASOURCE_DB_KIND=postgresql
+      - QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://polaris-postgres:5432/polaris
+      - QUARKUS_DATASOURCE_USERNAME=polaris
+      - QUARKUS_DATASOURCE_PASSWORD=polaris
+      # Realm context — MUST be set or Polaris returns "Realm is not bootstrapped".
+      - POLARIS_REALM_CONTEXT_REALMS=default
+      - POLARIS_BOOTSTRAP_CREDENTIALS=default,root,secret
+      # Storage type support: enable S3 (MiniStack) + relax insecure-storage guard.
+      - POLARIS_FEATURES_ALLOW_INSECURE_STORAGE_TYPES=true
+      - POLARIS_FEATURES_SUPPORTED_CATALOG_STORAGE_TYPES=["FILE","S3","GCS","AZURE"]
+      # Skip STS credential subscoping — MiniStack Community doesn't implement
+      # STS AssumeRole. With this flag, Polaris authorizes catalog operations via
+      # OAuth2 but does NOT vend short-lived S3 credentials; the client (Spark)
+      # uses its own ambient AWS_* / s3a.access-key credentials to read/write S3.
+      # Safe for local teaching lab; NOT safe for production (defeats least-privilege).
+      - POLARIS_FEATURES_SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION=true
+      - POLARIS_READINESS_IGNORE_SEVERE_ISSUES=true
+      - QUARKUS_OTEL_SDK_DISABLED=true
+      # AWS SDK endpoint overrides — route every AWS service call through MiniStack.
+      # AWS_ENDPOINT_URL is the general fallback; per-service ones (S3, STS) win
+      # when set. STS is what Polaris hits to vend scoped credentials; without
+      # this it defaults to real AWS STS and returns 403 "invalid security token".
+      - AWS_ENDPOINT_URL=http://ministack:4566
+      - AWS_ENDPOINT_URL_S3=http://ministack:4566
+      - AWS_ENDPOINT_URL_STS=http://ministack:4566
+      - AWS_S3_FORCE_PATH_STYLE=true
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+    depends_on:
+      ministack:
+        condition: service_healthy
+      polaris-postgres:
+        condition: service_healthy
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    # Polaris 1.6 exposes /q/health on the management port 8182.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Nimtable — Iceberg catalog browser (two-container split: backend + web UI)
+  # Nimtable ships as TWO containers per their official docker-compose:
+  #   - nimtable      : Java backend, REST API on 8182 (no browser page)
+  #   - nimtable-web  : Next.js frontend, browser UI on 3000 (this is what a
+  #                     student opens in their browser)
+  # The single `nimtable/nimtable:latest` image on Docker Hub is a legacy
+  # backend-only build (2025-12-03) — no bundled UI, no `latest` tag on GHCR.
+  # Both current images live under ghcr.io/nimtable/* on the `nightly` tag.
+  nimtable:
+    image: ghcr.io/nimtable/nimtable:nightly
+    container_name: nimtable
+    profiles: ["catalogs"]
+    # Nimtable can spin up an embedded Spark for compaction — allow 2 GB.
+    mem_limit: ${NIMTABLE_MEM_LIMIT:-2g}
+    # Backend REST API — internal to the lab network. The web UI calls it via
+    # JAVA_API_URL below. Not published to host to keep the surface minimal.
+    expose:
+      - "8182"
+    environment:
+      JAVA_OPTS: "-Xmx1500m -Xms256m"
+    volumes:
+      - ./services/catalogs/nimtable/config.yaml:/nimtable/config.yaml:ro
+    depends_on:
+      nessie:
+        condition: service_healthy
+      polaris:
+        condition: service_healthy
+      polaris-postgres:
+        condition: service_healthy
+    # Nimtable has no /health endpoint — all backend routes are under /api/*.
+    # /api/catalogs returns 200 with the configured catalog list (cheap boot signal).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8182/api/catalogs > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Nimtable Web — browser UI (Next.js) ───────────────────────────────────
+  # This is what students open at http://localhost:${NIMTABLE_PORT:-8090}.
+  # Talks to the backend via container DNS (`nimtable:8182`), so no host-side
+  # cross-container hop. Uses admin/admin default for the local lab; JWT_SECRET
+  # is a placeholder — safe here, DO NOT copy this config outside the lab.
+  nimtable-web:
+    image: ghcr.io/nimtable/nimtable-web:nightly
+    container_name: nimtable-web
+    profiles: ["catalogs"]
+    mem_limit: ${NIMTABLE_WEB_MEM_LIMIT:-512m}
+    ports:
+      # Keep the host port stable at 8090 (matches historical Makefile output)
+      # even though the container listens on 3000 — one env var flip if you
+      # want the Next.js-native 3000.
+      - "${NIMTABLE_PORT:-8090}:3000"
+    environment:
+      - JAVA_API_URL=http://nimtable:8182
+      - DATABASE_URL=postgresql://polaris:polaris@polaris-postgres:5432/nimtable
+      - JWT_SECRET=dev-only-not-secret
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=admin
+    depends_on:
+      nimtable:
+        condition: service_healthy
+    restart: unless-stopped

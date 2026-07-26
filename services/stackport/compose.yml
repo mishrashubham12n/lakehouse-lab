@@ -1,0 +1,25 @@
+# =============================================================================
+# services/stackport — AWS resource browser UI (S3 + Glue + IAM + Lambda + ...)
+# =============================================================================
+# Opt-in via profile: explorer. Started by `make stackport-up`.
+# Points at MiniStack's endpoint. Same UI works for any AWS-compatible endpoint.
+# =============================================================================
+
+services:
+
+  stackport:
+    image: davireis/stackport:latest
+    container_name: stackport
+    profiles: ["explorer"]
+    mem_limit: ${STACKPORT_MEM_LIMIT:-256m}
+    ports:
+      - "${STACKPORT_PORT:-8082}:8080"
+    environment:
+      - AWS_ENDPOINT_URL=http://ministack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    depends_on:
+      ministack:
+        condition: service_healthy
+    restart: unless-stopped

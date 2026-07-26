@@ -1,0 +1,30 @@
+# =============================================================================
+# services/ministack — Local AWS emulator (S3 + Glue + IAM + STS)
+# =============================================================================
+# Always-on. MIT-licensed successor to LocalStack Community.
+# All table data (Iceberg/Delta/Hudi warehouses) lives in the `warehouse` bucket.
+# Backed by ./.tmp/ministack/ — wiped by `make clean`.
+# =============================================================================
+
+services:
+
+  ministack:
+    image: ministackorg/ministack:latest
+    container_name: ministack
+    ports:
+      - "${MINISTACK_PORT:-4566}:4566"
+    environment:
+      # Only the services we teach — trims memory footprint.
+      - SERVICES=s3,glue,iam,sts
+      - DEFAULT_REGION=us-east-1
+      - PERSIST_DIR=/var/lib/ministack
+    volumes:
+      - ./.tmp/ministack:/var/lib/ministack
+    # NOTE: curl is not shipped in the ministack image; use python (bundled).
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4566/_localstack/health', timeout=2)\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped

@@ -1,0 +1,57 @@
+# =============================================================================
+# services/spark — Unified Spark Server (Thrift + Connect) + History
+# =============================================================================
+# Approx footprint: spark-connect ~3 GB (SPARK_MEM_LIMIT), history ~0.4 GB.
+# Resource profile is flipped via `make up` (tuned) vs `make up-constrained`.
+# Values live in conf/profiles/{tuned,constrained}.env — single source of truth.
+# =============================================================================
+
+services:
+
+  # ── Spark Unified Server (Thrift + Connect in same JVM) ───────────────────
+  spark-connect:
+    build:
+      context: .
+      dockerfile: services/spark/Dockerfile
+    image: lakehouse-lab:latest
+    container_name: spark-connect
+    mem_limit: ${SPARK_MEM_LIMIT:-3g}
+    ports:
+      - "${SPARK_CONNECT_PORT:-15002}:15002"
+      - "${SPARK_THRIFT_PORT:-10000}:10000"
+      - "${SPARK_UI_PORT:-4040}:4040"
+    volumes:
+      - .:/app
+      - ivy-cache:/root/.ivy2
+    environment:
+      - SPARK_CONF_DIR=/app/conf
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      # Resource profile — flipped by `make up` vs `make up-constrained`.
+      - SPARK_DRIVER_MEMORY=${SPARK_DRIVER_MEMORY:-2g}
+      - SPARK_CORES=${SPARK_CORES:-*}
+    command: ["connect"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ministack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 15002 && nc -z localhost 10000 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
+  # ── Spark History Server ──────────────────────────────────────────────────
+  spark-history:
+    image: lakehouse-lab:latest
+    container_name: spark-history
+    ports:
+      - "${SPARK_HISTORY_PORT:-18080}:18080"
+    volumes:
+      - .:/app
+    environment:
+      - SPARK_CONF_DIR=/app/conf
+    command: ["history"]
+    restart: unless-stopped
